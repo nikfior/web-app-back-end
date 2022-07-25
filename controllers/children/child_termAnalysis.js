@@ -16,7 +16,7 @@ const silhouetteCoefficient = require("../silhouette_coefficient");
 const { breadth } = require("treeverse");
 const { writeFileSync, unlinkSync } = require("fs");
 const { spawnSync } = require("child_process");
-const distinctColors = require("distinct-colors").default;
+const distinctColors = require("distinct-colors").default; // TODO make 20 nice distinct colors and make the global for each nodeLabel
 const clone = require("clone");
 
 // ----
@@ -36,6 +36,9 @@ const childTermAnalysis = async (sanitizedId, sanitizedUpperNodeLimit, sanitized
     // in case there are less subdirs than the upper limit
     sanitizedUpperSubdirNum =
       sanitizedUpperSubdirNum > site.subdirsname.length ? site.subdirsname.length : sanitizedUpperSubdirNum;
+
+    let sanitizedSupport = sanitizedUpperSubdirNum; // TODOTODO make into query
+    let sanitizedLowerNodeLimit = 3; // TODOTODO make into query
 
     let nodesDirArr = []; // each index is a site directory
     // each subdirectory of the site is passed in extractTerms to get back the terms. I am also passing the index of the subdirectory so that I can use it as part of the Id of each node
@@ -96,27 +99,30 @@ const childTermAnalysis = async (sanitizedId, sanitizedUpperNodeLimit, sanitized
     //
     console.log("Before convertToGspanFormatAndModifyDom");
     const gspanIn = convertToGspanFormatAndModifyDom(domFromAllSubdirs, sanitizedId, maxAllres, site.url);
+
+    // adds stylization info (colored rectangles) to dom elements that belong in a cluster (doesn't actually stylize them)
+    stylizeDomElementsByClusterLabel(domFromAllSubdirs, maxAllres);
+
     console.log("Before pythonGspan");
-    const gspanOut = pythonGspan(sanitizedId, sanitizedUpperNodeLimit);
-
-    // domFromAllSubdirs2 is a clone of domFromAllSubdirs that will not have its different nodes stylized depending on their cluster label. It will be used in the gspanOutToDotGraph function to render the frequent trees in html
-    const domFromAllSubdirsUnmodified = clone(domFromAllSubdirs);
-    // const domFromAllSubdirs2 = structuredClone(domFromAllSubdirs);
-
-    // adds stylization (colored rectangles) to dom elements that belong in a cluster
-    stylizedDomElementsByClusterLabel(domFromAllSubdirs, maxAllres);
+    const gspanOut = pythonGspan(
+      sanitizedId,
+      sanitizedUpperNodeLimit,
+      sanitizedLowerNodeLimit,
+      sanitizedSupport
+    );
 
     console.log("Before gspanOutToDotGraph");
     const dotgraphTrees = gspanOut.graphs
-      ? gspanOutToDotGraph(gspanOut, domFromAllSubdirsUnmodified, nodesDirArr)
+      ? gspanOutToDotGraph(gspanOut, domFromAllSubdirs, nodesDirArr)
       : null;
+
     const newAnalysis = await DB_Model_Analysis.findOneAndUpdate(
       { datasetSiteId: sanitizedId },
       {
         status: `Completed at ${new Date()}. With query parameters uppernodelimit=${sanitizedUpperNodeLimit} and subdirnum=${sanitizedUpperSubdirNum}`,
         analysis: {
           dotgraphTrees,
-          gspanOut,
+          gspanOut: { graphs: gspanOut.graphs, support: gspanOut.support, where: gspanOut.where }, // removed gspanOut.origins
           gspanIn,
 
           clusteredBow,
@@ -148,6 +154,7 @@ const childTermAnalysis = async (sanitizedId, sanitizedUpperNodeLimit, sanitized
       );
     } catch (error) {
       console.log("error saving the error in status: " + error.message);
+      process.exit();
     }
     console.log(error.message);
     process.exit();
@@ -156,13 +163,14 @@ const childTermAnalysis = async (sanitizedId, sanitizedUpperNodeLimit, sanitized
 
 // ----
 
-const gspanOutToDotGraph = (gspanOut, domFromAllSubdirsUnmodified, nodesDirArr) => {
-  // sort based on support
+const gspanOutToDotGraph = (gspanOut, domFromAllSubdirs, nodesDirArr) => {
   const dotGraphsTemp = [];
   const dotSupport = [];
   const dotWhere = [];
   const dotOrigins = [];
   const tempList = [];
+
+  // sort based on support
   for (let i = 0; i < gspanOut.support.length; i++) {
     tempList.push({
       graphs: gspanOut.graphs[i],
@@ -211,32 +219,41 @@ const gspanOutToDotGraph = (gspanOut, domFromAllSubdirsUnmodified, nodesDirArr) 
     dotgraphs.at(-1).push(`}`);
   }
 
+  // TODO also check their edges as well as their nodeLabels before deleting/merging them
   //
   // make a temporary nodeLabels array to clean up unecessary data
   const nodeLabels = [];
+  // const nodeEdges = [];
   for (let i = 0; i < dotgraphs.length; i++) {
     nodeLabels.push(Array.from(dotgraphs[i].join("\n").matchAll(/^\d+ \[label="(-?\d+)/gm), (x) => x[1]));
+    // nodeEdges.push(Array.from(dotgraphs[i].join("\n").matchAll(/^(\d+ -> \d+))/gm), (x) => x[1]));
+    // const matchedEdges = dotgraphs[i].join("\n").matchAll(/^(\d+) -> (\d+)/gm);
+    // nodeEdges.push([]);
+    // for (let edge of matchedEdges) {
+    //   nodeEdges.at(-1).push([edge[1], edge[2]]);
+    // }
   }
 
-  // remove dotgraphs that have only -1 labels
+  // remove dotgraphs that have less than 2 numbered labels than are not -1
   for (let i = 0; i < nodeLabels.length; i++) {
-    if (nodeLabels[i].every((x) => x === "-1")) {
+    if (nodeLabels[i].filter((x) => x !== "-1").length < 2) {
       dotgraphs.splice(i, 1);
       dotWhere.splice(i, 1);
       dotSupport.splice(i, 1);
       dotOrigins.splice(i, 1);
       nodeLabels.splice(i, 1);
+      // nodeEdges.splice(i, 1);
       i--;
     }
   }
 
   // sort and filter to be used for later analyzing and cleanup
   for (let i = 0; i < nodeLabels.length; i++) {
-    nodeLabels[i].sort();
     nodeLabels[i] = nodeLabels[i].filter((x) => x !== "-1");
+    nodeLabels[i].sort();
   }
 
-  // remove frequent trees that are the same as others but with additional -1 labels. Basically remove unecessary -1 labels
+  // cleanup and merge frequent trees that are the same as others but with additional -1 labels.
   for (let i = 0; i < nodeLabels.length; i++) {
     for (let j = 0; j < nodeLabels.length; j++) {
       if (i === j) {
@@ -246,11 +263,20 @@ const gspanOutToDotGraph = (gspanOut, domFromAllSubdirsUnmodified, nodesDirArr) 
         continue;
       }
       if (nodeLabels[j].every((x) => nodeLabels[i].includes(x))) {
+        // TODOTODO also check edges because eg nodeLabels [17,17] will get merged with [17,15] with the way i am doing it now
+
+        // merge the origins and change the where and the support
+        mergeDotOrigins(dotOrigins, dotWhere, i, j);
+        dotWhere[i] = [...new Set([...dotWhere[i], ...dotWhere[j]])];
+        dotSupport[i] = dotWhere[i].length.toString();
+        // remove merged array
         dotgraphs.splice(j, 1);
         dotWhere.splice(j, 1);
         dotSupport.splice(j, 1);
         dotOrigins.splice(j, 1);
         nodeLabels.splice(j, 1);
+
+        // position readjustment because i removed an item from the list i was iterating
         if (j < i) {
           i--;
         }
@@ -260,65 +286,90 @@ const gspanOutToDotGraph = (gspanOut, domFromAllSubdirsUnmodified, nodesDirArr) 
   }
 
   // create the html rendering of the frequent trees
-  const dotgraphBackRenderedDoms = [];
-  for (let i = 0; i < nodeLabels.length; i++) {
-    const dom = clone(domFromAllSubdirsUnmodified[dotWhere[i][0]]);
-    // dotOrigins.forEach((graph) => {
-    //   graph.forEach((subdir) => {
-    //     subdir.forEach((origin) => {
-    //       origin.forEach((line) => {
-    //         dom
-    //           .querySelector(`[vertexCounter=${line[0]}]`)
-    //           .setAttribute("style", `border-style: solid;border-color: red;border-width: thick;`);
-    //         dom
-    //           .querySelector(`[vertexCounter=${line[1]}]`)
-    //           .setAttribute("style", `border-style: solid;border-color: red;border-width: thick;`);
-    //       });
-    //     });
-    //   });
-    // });
-    dotOrigins.forEach((graph) => {
-      graph[0].forEach((origin) => {
+  // const dotgraphBackRenderedDoms = [];
+  for (let i = 0; i < dotOrigins.length; i++) {
+    // dotgraphBackRenderedDoms.push([]);
+    for (let j = 0; j < dotWhere[i].length; j++) {
+      // const dom = clone(domFromAllSubdirs[dotWhere[i][j]]);
+      const dom = domFromAllSubdirs[dotWhere[i][j]];
+
+      //
+      //
+      //TODOTODOTODO save info instead of changing
+      // dotOrigins[i][j].forEach((origin) => {
+      //   origin.forEach((line) => {
+      //     dom
+      //       .querySelector(`[vertexCounter=${line[0]}]`)
+      //       .setAttribute("style", `border-style: solid;border-color: red;border-width: thick;`);
+      //     dom
+      //       .querySelector(`[vertexCounter=${line[1]}]`)
+      //       .setAttribute("style", `border-style: solid;border-color: red;border-width: thick;`);
+      //   });
+      // });
+
+      //
+      dotOrigins[i][j].forEach((origin) => {
         origin.forEach((line) => {
-          dom
-            .querySelector(`[vertexCounter=${line[0]}]`)
-            .setAttribute("style", `border-style: solid;border-color: red;border-width: thick;`);
-          dom
-            .querySelector(`[vertexCounter=${line[1]}]`)
-            .setAttribute("style", `border-style: solid;border-color: red;border-width: thick;`);
+          const digraphIndex = dotgraphs[i][0].split(" ")[1];
+          const oldone = dom.querySelector(`[vertexCounter=${line[0]}]`).getAttribute("digraphLabelStylize");
+          if ((oldone && !oldone.includes(`;${digraphIndex};`)) || !oldone) {
+            dom
+              .querySelector(`[vertexCounter=${line[0]}]`)
+              .setAttribute(
+                "digraphLabelStylize",
+                oldone ? oldone + `${digraphIndex};` : `;${digraphIndex};`
+              );
+          }
+
+          const oldtwo = dom.querySelector(`[vertexCounter=${line[1]}]`).getAttribute("digraphLabelStylize");
+          if ((oldtwo && !oldtwo.includes(`;${digraphIndex};`)) || !oldtwo) {
+            dom
+              .querySelector(`[vertexCounter=${line[1]}]`)
+              .setAttribute(
+                "digraphLabelStylize",
+                oldtwo ? oldtwo + `${digraphIndex};` : `;${digraphIndex};`
+              );
+          }
+          //
         });
       });
-    });
 
-    // ---
-    // for (let number of nodeLabels[i]) {
-    //   dom
-    //     .querySelector(`[customId$=${number}]`)
-    //     .setAttribute("style", `border-style: solid;border-color: red;border-width: thick;`);
-    // }
-    dotgraphBackRenderedDoms.push(dom.toString());
+      // dotgraphBackRenderedDoms[i].push(dom.toString());
+    }
   }
 
-  return { dotgraphs, dotWhere, dotSupport, dotgraphBackRenderedDoms };
+  // not returning dotOrigins due to its size
+  return { dotgraphs, dotWhere, dotSupport };
 };
 
 // ----
 
-const pythonGspan = (sanitizedId, sanitizedUpperNodeLimit) => {
-  const pyArgs = [
-    "-m",
-    "python_lib.gspan_mining",
-    "-s",
-    "2",
-    "-u",
-    sanitizedUpperNodeLimit,
-    "-w",
-    "True",
-    "-d",
-    "True",
-    sanitizedId + "gspanIn.txt",
-  ];
-  const pyProg = spawnSync("python", pyArgs, { maxBuffer: Infinity });
+const pythonGspan = (sanitizedId, sanitizedUpperNodeLimit, sanitizedLowerNodeLimit, sanitizedSupport) => {
+  let pyProg;
+
+  for (let i = sanitizedSupport; i > 1; i--) {
+    const pyArgs = [
+      "-m",
+      "python_lib.gspan_mining",
+      "-s",
+      i,
+      "-l",
+      sanitizedLowerNodeLimit,
+      "-u",
+      sanitizedUpperNodeLimit,
+      "-w",
+      "True",
+      "-d",
+      "True",
+      sanitizedId + "gspanIn.txt",
+    ];
+
+    pyProg = spawnSync("python", pyArgs, { maxBuffer: Infinity });
+
+    if (pyProg.stdout.toString().startsWith("t #")) {
+      break;
+    }
+  }
 
   // remove file for gspan after finishing
   unlinkSync(sanitizedId + "gspanIn.txt");
@@ -376,7 +427,7 @@ const pythonGspan = (sanitizedId, sanitizedUpperNodeLimit) => {
       origins.push([]);
       oldSub = null;
     } else {
-      console.log("Unexptected condition. Check it");
+      console.log("Unexpected condition. Check it");
     }
   }
 
@@ -390,6 +441,7 @@ const convertToGspanFormatAndModifyDom = (domFromAllSubdirs, sanitizedId, maxAll
   let vertexCounter;
   let i;
 
+  // ----starting functions used to iterate the dom with the breadth package----
   // const getChildren = (node) => node.childNodes;
   const getChildren = (node) => {
     // TODO change if i also search for titles as well as texts
@@ -428,7 +480,9 @@ const convertToGspanFormatAndModifyDom = (domFromAllSubdirs, sanitizedId, maxAll
 
     vertexCounter++;
   };
+  // ----ending functions used to iterate the dom with the breadth package-----
 
+  //
   // loop for every subdir
   for (i = 0; i < domFromAllSubdirs.length; i++) {
     vertexCounter = 0;
@@ -547,12 +601,6 @@ const getKmeansNodexNode = (nodesDirArr) => {
   //
   console.log("first");
   const allNodesFromAllSubds = nodesDirArr.flat(10); // allNodesFromAllSubds: all nodes from all subds in one array
-  // let allNodesFromAllSubds = [];
-  // nodesDirArr.forEach((subd) => {
-  //   subd.forEach((node) => {
-  //     allNodesFromAllSubds.push(node);
-  //   });
-  // });
 
   console.log("second with length " + allNodesFromAllSubds.length);
   //
@@ -593,7 +641,7 @@ const getKmeansNodexNode = (nodesDirArr) => {
   for (let c = 2; c < upperLimit; c++) {
     for (let i = 0; i < 40; i++) {
       console.log("in kmeans at c= " + c + " and repeat at i= " + i);
-      // for 10 iterations use the kmpp initialization algorithm
+      // for the first 10 iterations use the kmpp initialization algorithm and for the rest use normal randomization
       let res = skmeans(nodexnode, c, i < 10 ? "kmpp" : null, null, costumDistanceFormula);
       // console.log(res);
       let coef = silhouetteCoefficient(nodexnode, res.idxs, costumDistanceFormula);
@@ -643,11 +691,7 @@ const costumDistanceFormula = (a, b) => {
   let aIndex = a.indexOf(1);
   let bIndex = b.indexOf(1);
   let index;
-  // if (bIndex !== -1) {
-  //   console.log("BOTH");
-  //   console.log("a", a, "aIndex", aIndex);
-  //   console.log("b", b, "bIndex", bIndex);
-  // }
+
   index = aIndex !== -1 ? aIndex : bIndex;
   if (aIndex !== -1 && bIndex !== -1) {
     // console.log("out", -(a[bIndex] - 1));
@@ -660,41 +704,6 @@ const costumDistanceFormula = (a, b) => {
     return aIndex !== -1 ? -(b[index] - 1) : -(a[index] - 1);
     // return -((a[bIndex] + b[aIndex]) / 2 - 1);
   }
-};
-
-// ---
-
-const getCosineSimilarityPerSubd = (nodesDirArr) => {
-  let cosineSimilarityPerSubd = [];
-
-  // allNodeTermsPerSubd: each index is a subdirectory which has all the terms of all the nodes of that subdirectory and the terms are flattened and not in groups of their node
-  // nodeTermsPerSubd: each index is a subdirectory which has the terms of all the nodes of that subdirectory and the terms are in grouped based on their node
-  let allNodeTermsPerSubd = [];
-  let nodeTermsPerSubd = [];
-  nodesDirArr.forEach((subd) => {
-    const TermsInSubd = subd.map((node) => node.terms);
-    allNodeTermsPerSubd.push(TermsInSubd.flat(10));
-    nodeTermsPerSubd.push(TermsInSubd);
-  });
-
-  const allNodeTermsPerSubdBow = allNodeTermsPerSubd.map((subd) => as.bow(subd));
-  const nodeTermsPerSubdBow = nodeTermsPerSubd.map((subd) => {
-    return subd.map((nodeTerms) => as.bow(nodeTerms));
-  });
-
-  for (let i = 0; i < allNodeTermsPerSubdBow.length; i++) {
-    let subdCosineSimilarity = [];
-    for (let k = 0; k < nodeTermsPerSubdBow.length; k++) {
-      for (let j = 0; j < nodeTermsPerSubdBow[k].length; j++) {
-        subdCosineSimilarity.push(
-          similarity.bow.cosine(nodeTermsPerSubdBow[k][j], allNodeTermsPerSubdBow[i])
-        );
-      }
-    }
-    cosineSimilarityPerSubd.push(subdCosineSimilarity);
-  }
-
-  return cosineSimilarityPerSubd;
 };
 
 // ----
@@ -783,89 +792,94 @@ const cssAndImgToAbsoluteHref = (dom, url) => {
   //
 };
 
-const stylizedDomElementsByClusterLabel = (domFromAllSubdirs, maxAllres) => {
+//
+//
+const stylizeDomElementsByClusterLabel = (domFromAllSubdirs, maxAllres) => {
   const palette = distinctColors({ count: maxAllres.k });
 
   for (let dom of domFromAllSubdirs) {
     const nodes = dom.querySelectorAll("[customId]");
     for (let node of nodes) {
       const kmeansClusterLabel = maxAllres.idxs[node.getAttribute("customId").split(";")[1]];
+      // node.setAttribute(
+      //   "style",
+      //   `border-style: solid;border-color: ${palette[kmeansClusterLabel].hex()};border-width: thick;`
+      // );
+
       node.setAttribute(
-        "style",
-        `border-style: solid;border-color: ${palette[kmeansClusterLabel].hex()};border-width: thick;`
+        "nodeLabelAndColorStylize",
+        `${kmeansClusterLabel};${palette[kmeansClusterLabel].hex()}`
       );
     }
   }
+};
 
-  // let label = node.nodeType === 1 ? node.getAttribute("customId") || "-1" : "-1";
-  // const kmeansClusterLabel = label === "-1" ? undefined : maxAllres.idxs[label.split(";")[1]];
-  // // modify dom to display colored border depending on its cluster
-  // if (label !== "-1") {
-  //   node.setAttribute(
-  //     "style",
-  //     `border-style: solid;border-color: ${palette[kmeansClusterLabel].hex()};border-width: thick;`
-  //   );
-  // }
+//
+// merge the origins of graph b to the origins of graph a
+const mergeDotOrigins = (dotOrigins, dotWhere, a, b) => {
+  for (let i = 0; i < dotWhere[b].length; i++) {
+    let whereExistsFlag = false;
+    for (let j = 0; j < dotWhere[a].length; j++) {
+      if (dotWhere[b][i] === dotWhere[a][j]) {
+        for (let k = 0; k < dotOrigins[b][i].length; k++) {
+          let originExistsFlag = false;
+          for (let l = 0; l < dotOrigins[a][j].length; l++) {
+            if (
+              dotOrigins[b][i][k].flat(10).sort().toString() ===
+              dotOrigins[a][j][l].flat(10).sort().toString()
+            ) {
+              originExistsFlag = true;
+              break;
+            }
+          }
+          if (originExistsFlag === false) {
+            dotOrigins[a][j].push(dotOrigins[b][i][k]);
+          }
+        }
+        whereExistsFlag = true;
+        break;
+      }
+    }
+
+    if (whereExistsFlag === false) {
+      dotOrigins[a].push(dotOrigins[b][i]);
+    }
+  }
 };
 
 // ====================================================================
 
-// const { parentPort } = require("worker_threads");
+// ---
 
-// // function cpuIntensiveTask(responseTime) {
-// //   console.log("cpuIntensiveTask started......");
-// //   let startTime = Date.now();
-// //   while (Date.now() - startTime < responseTime) {
-// //     const kk = 0;
-// //   }
-// //   console.log("cpuIntensiveTask completed in :" + (Date.now() - startTime) + " ms.");
-// //   return Date.now() - startTime;
-// // }
-// // parentPort.on("message", (message) => {
-// //   console.log(message);
-// //   if (message.command == "SLEEP") {
-// //     setTimeout(() => {
-// //       console.log(
-// //         "\nTest Child Event-Loop :cpuIntensiveTask in child thread blocks this event in child thread!"
-// //       );
-// //     }, 1000);
-// //     console.log("first");
-// //     const result = cpuIntensiveTask(message.responseTime);
-// //     console.log("second");
-// //     parentPort.postMessage("Completeed in :" + result + " ms.");
-// //     console.log("end");
-// //     process.exit();
-// //   }
-// // });
+const getCosineSimilarityPerSubd = (nodesDirArr) => {
+  let cosineSimilarityPerSubd = [];
 
-// // -------------------
+  // allNodeTermsPerSubd: each index is a subdirectory which has all the terms of all the nodes of that subdirectory and the terms are flattened and not in groups of their node
+  // nodeTermsPerSubd: each index is a subdirectory which has the terms of all the nodes of that subdirectory and the terms are in grouped based on their node
+  let allNodeTermsPerSubd = [];
+  let nodeTermsPerSubd = [];
+  nodesDirArr.forEach((subd) => {
+    const TermsInSubd = subd.map((node) => node.terms);
+    allNodeTermsPerSubd.push(TermsInSubd.flat(10));
+    nodeTermsPerSubd.push(TermsInSubd);
+  });
 
-// function outfun() {
-//   let k = 0;
-//   console.log("starting cpu-heavy");
-//   for (let i = 0; i < 50; i++) {
-//     for (let j = 0; j < 99999999; j++) {
-//       k++;
-//     }
-//   }
-//   console.log("ended cpu-heavy");
-//   return k;
-// }
+  const allNodeTermsPerSubdBow = allNodeTermsPerSubd.map((subd) => as.bow(subd));
+  const nodeTermsPerSubdBow = nodeTermsPerSubd.map((subd) => {
+    return subd.map((nodeTerms) => as.bow(nodeTerms));
+  });
 
-// parentPort.on("message", (message) => {
-//   console.log("in worker", message);
-//   if (message.command == "SLEEP") {
-//     setTimeout(() => {
-//       console.log(
-//         "\nTest Child Event-Loop :cpuIntensiveTask in child thread blocks this event in child thread!"
-//       );
-//     }, 20000);
-//     console.log("first");
-//     const result = outfun();
-//     console.log("second");
-//     parentPort.postMessage("in worker found :" + result);
-//     console.log("end");
-//     setTimeout(() => process.exit(), 500);
-//     // process.exit();
-//   }
-// });
+  for (let i = 0; i < allNodeTermsPerSubdBow.length; i++) {
+    let subdCosineSimilarity = [];
+    for (let k = 0; k < nodeTermsPerSubdBow.length; k++) {
+      for (let j = 0; j < nodeTermsPerSubdBow[k].length; j++) {
+        subdCosineSimilarity.push(
+          similarity.bow.cosine(nodeTermsPerSubdBow[k][j], allNodeTermsPerSubdBow[i])
+        );
+      }
+    }
+    cosineSimilarityPerSubd.push(subdCosineSimilarity);
+  }
+
+  return cosineSimilarityPerSubd;
+};
